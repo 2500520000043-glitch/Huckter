@@ -82,6 +82,11 @@ type SignalPayload = {
   candidate?: RTCIceCandidateInit;
 };
 
+type IceServerFunctionResponse = {
+  iceServers?: unknown;
+  ttlSeconds?: unknown;
+};
+
 const pendingInviteStorageKey = "pendingInviteToken";
 
 const statusCycle: Array<ConversationCard["status"]> = [
@@ -110,6 +115,48 @@ const defaultIceServers: RTCIceServer[] = [
   }
 ];
 
+const normalizeIceServer = (entry: unknown): RTCIceServer | null => {
+  if (typeof entry !== "object" || entry === null) {
+    return null;
+  }
+  const value = entry as Record<string, unknown>;
+  const urls = value.urls ?? value.url;
+  if (
+    !(
+      typeof urls === "string" ||
+      (Array.isArray(urls) && urls.every((item) => typeof item === "string"))
+    )
+  ) {
+    return null;
+  }
+
+  const server: RTCIceServer = {
+    urls: urls as string | string[]
+  };
+  if (typeof value.username === "string") {
+    server.username = value.username;
+  }
+  if (typeof value.credential === "string") {
+    server.credential = value.credential;
+  }
+  return server;
+};
+
+const sanitizeIceServers = (value: unknown): RTCIceServer[] => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((entry) => normalizeIceServer(entry))
+    .filter((entry): entry is RTCIceServer => entry !== null);
+};
+
+const hasTurnServer = (servers: RTCIceServer[]) =>
+  servers.some((server) => {
+    const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+    return urls.some((url) => /^turns?:/i.test(String(url)));
+  });
+
 const parseIceServers = (): RTCIceServer[] => {
   const raw = import.meta.env.VITE_ICE_SERVERS_JSON as string | undefined;
   if (!raw?.trim()) {
@@ -118,16 +165,7 @@ const parseIceServers = (): RTCIceServer[] => {
 
   try {
     const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed) || parsed.length === 0) {
-      return defaultIceServers;
-    }
-    const valid = parsed.filter(
-      (entry: unknown) =>
-        typeof entry === "object" &&
-        entry !== null &&
-        ("urls" in (entry as Record<string, unknown>))
-    ) as RTCIceServer[];
-
+    const valid = sanitizeIceServers(parsed);
     return valid.length > 0 ? valid : defaultIceServers;
   } catch {
     return defaultIceServers;
@@ -184,6 +222,10 @@ function App() {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [isMicMuted, setIsMicMuted] = useState(false);
+  const [iceConfigMode, setIceConfigMode] = useState<"env" | "dynamic">("env");
+  const [currentIceServers, setCurrentIceServers] = useState<RTCIceServer[]>(
+    ICE_SERVERS
+  );
 
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const callSignalChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(
@@ -194,11 +236,20 @@ function App() {
   const activeCallRef = useRef<ActiveCall | null>(null);
   const incomingCallRef = useRef<ActiveCall | null>(null);
   const pendingOutgoingCallRef = useRef<ActiveCall | null>(null);
+  const pendingRemoteCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const handshakeStartedForCallRef = useRef<number | null>(null);
+  const dynamicIceCacheRef = useRef<{ servers: RTCIceServer[]; expiresAt: number } | null>(
+    null
+  );
 
   const authed = Boolean(currentUser);
   const activeConversation = useMemo(
     () => conversations.find((item) => item.id === activeConversationId) ?? null,
     [activeConversationId, conversations]
+  );
+  const turnReady = useMemo(
+    () => hasTurnServer(currentIceServers),
+    [currentIceServers]
   );
 
   useEffect(() => {
@@ -276,6 +327,8 @@ function App() {
       peerConnectionRef.current.close();
       peerConnectionRef.current = null;
     }
+    pendingRemoteCandidatesRef.current = [];
+    handshakeStartedForCallRef.current = null;
     setLocalStream((current) => {
       current?.getTracks().forEach((track) => track.stop());
       return null;
@@ -326,14 +379,80 @@ function App() {
     []
   );
 
+  const resolveIceServers = useCallback(async (): Promise<RTCIceServer[]> => {
+    const cached = dynamicIceCacheRef.current;
+    const now = Date.now();
+    if (cached && cached.expiresAt > now + 15_000) {
+      return cached.servers;
+    }
+
+    try {
+      const { data, error } = await supabase.functions.invoke("twilio-ice-servers", {
+        body: {}
+      });
+      if (error) {
+        throw error;
+      }
+
+      const payload = (data ?? {}) as IceServerFunctionResponse;
+      const parsedServers = sanitizeIceServers(payload.iceServers);
+      if (parsedServers.length === 0) {
+        throw new Error("No ICE servers returned by TURN endpoint.");
+      }
+
+      const ttlCandidate = Number(payload.ttlSeconds);
+      const ttlSeconds =
+        Number.isFinite(ttlCandidate) && ttlCandidate > 0
+          ? Math.floor(ttlCandidate)
+          : 600;
+      const refreshSeconds = Math.max(30, ttlSeconds - 60);
+
+      dynamicIceCacheRef.current = {
+        servers: parsedServers,
+        expiresAt: now + refreshSeconds * 1000
+      };
+      setCurrentIceServers(parsedServers);
+      setIceConfigMode("dynamic");
+      return parsedServers;
+    } catch {
+      setCurrentIceServers(ICE_SERVERS);
+      setIceConfigMode("env");
+      return ICE_SERVERS;
+    }
+  }, []);
+
+  const flushPendingRemoteCandidates = useCallback(async () => {
+    const peer = peerConnectionRef.current;
+    if (!peer || !peer.remoteDescription) {
+      return;
+    }
+    const queued = pendingRemoteCandidatesRef.current;
+    if (queued.length === 0) {
+      return;
+    }
+    pendingRemoteCandidatesRef.current = [];
+    for (const candidate of queued) {
+      try {
+        await peer.addIceCandidate(candidate);
+      } catch {
+        // Ignore invalid/late candidates while connection stabilizes.
+      }
+    }
+  }, []);
+
   const createPeerConnection = useCallback(
-    (call: ActiveCall, stream: MediaStream, myUserId: string) => {
+    (
+      call: ActiveCall,
+      stream: MediaStream,
+      myUserId: string,
+      iceServers: RTCIceServer[]
+    ) => {
       if (peerConnectionRef.current) {
         peerConnectionRef.current.close();
       }
 
       const peer = new RTCPeerConnection({
-        iceServers: ICE_SERVERS
+        iceServers
       });
 
       stream.getTracks().forEach((track) => {
@@ -366,11 +485,21 @@ function App() {
       peer.onconnectionstatechange = () => {
         if (peer.connectionState === "connected") {
           setCallStatus("in-call");
+          setCallError(null);
           return;
         }
         if (peer.connectionState === "failed") {
           setCallStatus("error");
           setCallError("Call failed. Please try again.");
+        }
+      };
+
+      peer.oniceconnectionstatechange = () => {
+        if (peer.iceConnectionState === "failed") {
+          setCallStatus("error");
+          setCallError(
+            "Could not establish media route. Add TURN server for restricted networks."
+          );
         }
       };
 
@@ -385,10 +514,18 @@ function App() {
       if (!call.acceptedBy) {
         return;
       }
+      if (
+        handshakeStartedForCallRef.current === call.id &&
+        peerConnectionRef.current
+      ) {
+        return;
+      }
+      handshakeStartedForCallRef.current = call.id;
       try {
         setCallStatus("connecting");
         const stream = await ensureLocalStream();
-        const peer = createPeerConnection(call, stream, callerId);
+        const iceServers = await resolveIceServers();
+        const peer = createPeerConnection(call, stream, callerId, iceServers);
         const offer = await peer.createOffer();
         await peer.setLocalDescription(offer);
         await sendCallSignal("webrtc-offer", {
@@ -399,6 +536,7 @@ function App() {
           sdp: offer
         });
       } catch (error) {
+        handshakeStartedForCallRef.current = null;
         setCallStatus("error");
         setCallError(
           error instanceof Error
@@ -407,7 +545,7 @@ function App() {
         );
       }
     },
-    [createPeerConnection, ensureLocalStream, sendCallSignal]
+    [createPeerConnection, ensureLocalStream, resolveIceServers, sendCallSignal]
   );
 
   const loadConversations = useCallback(async () => {
@@ -575,6 +713,9 @@ function App() {
 
   useEffect(() => {
     if (!currentUser) {
+      dynamicIceCacheRef.current = null;
+      setCurrentIceServers(ICE_SERVERS);
+      setIceConfigMode("env");
       resetCallMedia();
       setActiveCall(null);
       setIncomingCall(null);
@@ -604,6 +745,13 @@ function App() {
       alive = false;
     };
   }, [currentUser, ensureProfile, loadConversations, resetCallMedia]);
+
+  useEffect(() => {
+    if (!currentUser) {
+      return;
+    }
+    void resolveIceServers();
+  }, [currentUser, resolveIceServers]);
 
   useEffect(() => {
     if (!currentUser || !pendingInviteToken || joiningInvite) {
@@ -906,8 +1054,15 @@ function App() {
         try {
           setCallStatus("connecting");
           const stream = await ensureLocalStream();
-          const peer = createPeerConnection(call, stream, currentUser.id);
+          const iceServers = await resolveIceServers();
+          const peer = createPeerConnection(
+            call,
+            stream,
+            currentUser.id,
+            iceServers
+          );
           await peer.setRemoteDescription(signal.sdp);
+          await flushPendingRemoteCandidates();
           const answer = await peer.createAnswer();
           await peer.setLocalDescription(answer);
           await sendCallSignal("webrtc-answer", {
@@ -930,6 +1085,7 @@ function App() {
         if (!signal.sdp || !peerConnectionRef.current) return;
 
         await peerConnectionRef.current.setRemoteDescription(signal.sdp);
+        await flushPendingRemoteCandidates();
       })
       .on("broadcast", { event: "webrtc-ice" }, async ({ payload }) => {
         const signal = payload as SignalPayload;
@@ -940,12 +1096,7 @@ function App() {
           if (peerConnectionRef.current.remoteDescription) {
             await peerConnectionRef.current.addIceCandidate(signal.candidate);
           } else {
-            window.setTimeout(() => {
-              if (!peerConnectionRef.current) return;
-              void peerConnectionRef.current.addIceCandidate(signal.candidate).catch(() => {
-                // Ignore late candidate failures.
-              });
-            }, 250);
+            pendingRemoteCandidatesRef.current.push(signal.candidate);
           }
         } catch {
           // Ignore ICE failures for MVP flow.
@@ -977,10 +1128,28 @@ function App() {
     createPeerConnection,
     currentUser,
     ensureLocalStream,
+    flushPendingRemoteCandidates,
+    resolveIceServers,
     resetCallMedia,
     sendCallSignal,
     startCallerHandshake
   ]);
+
+  useEffect(() => {
+    if (callStatus !== "connecting") {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setCallError(
+        "Still connecting. This usually means peer networking is blocked; TURN server is required."
+      );
+    }, 12000);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [callStatus]);
 
   const handleAuthSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -1645,6 +1814,8 @@ function App() {
           <ul>
             <li>Auth session: active</li>
             <li>Realtime: {realtimeStatus}</li>
+            <li>ICE config: {iceConfigMode === "dynamic" ? "twilio-turn" : "env"}</li>
+            <li>TURN available: {turnReady ? "yes" : "no"}</li>
             <li>Call state: {callStatus}</li>
             <li>Conversations: {conversations.length}</li>
             <li>Current room messages: {messages.length}</li>
