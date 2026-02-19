@@ -173,6 +173,8 @@ const parseIceServers = (): RTCIceServer[] => {
 };
 
 const ICE_SERVERS = parseIceServers();
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL as string;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
 
 function App() {
   const [authMode, setAuthMode] = useState<AuthMode>("signin");
@@ -390,20 +392,21 @@ function App() {
       const {
         data: { session }
       } = await supabase.auth.getSession();
-      const accessToken =
-        session?.access_token ??
-        (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined);
-      const { data, error } = await supabase.functions.invoke("twilio-ice-servers", {
-        body: {},
-        headers: accessToken
-          ? {
-              Authorization: `Bearer ${accessToken}`
-            }
-          : undefined
+      const bearerToken = session?.access_token ?? SUPABASE_ANON_KEY;
+      const response = await fetch(`${SUPABASE_URL}/functions/v1/twilio-ice-servers`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${bearerToken}`
+        },
+        body: "{}"
       });
-      if (error) {
-        throw error;
+
+      if (!response.ok) {
+        throw new Error(`TURN endpoint request failed (${response.status}).`);
       }
+      const data = (await response.json()) as IceServerFunctionResponse;
 
       const payload = (data ?? {}) as IceServerFunctionResponse;
       const parsedServers = sanitizeIceServers(payload.iceServers);
