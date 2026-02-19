@@ -387,8 +387,19 @@ function App() {
     }
 
     try {
+      const {
+        data: { session }
+      } = await supabase.auth.getSession();
+      const accessToken =
+        session?.access_token ??
+        (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined);
       const { data, error } = await supabase.functions.invoke("twilio-ice-servers", {
-        body: {}
+        body: {},
+        headers: accessToken
+          ? {
+              Authorization: `Bearer ${accessToken}`
+            }
+          : undefined
       });
       if (error) {
         throw error;
