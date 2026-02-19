@@ -82,6 +82,8 @@ type SignalPayload = {
   candidate?: RTCIceCandidateInit;
 };
 
+const pendingInviteStorageKey = "pendingInviteToken";
+
 const statusCycle: Array<ConversationCard["status"]> = [
   "online",
   "away",
@@ -163,6 +165,13 @@ function App() {
   const [unreadByConversation, setUnreadByConversation] = useState<
     Record<number, number>
   >({});
+  const [inviteFeedback, setInviteFeedback] = useState<string | null>(null);
+  const [pendingInviteToken, setPendingInviteToken] = useState<string | null>(() => {
+    const urlToken = new URLSearchParams(window.location.search).get("invite");
+    const storedToken = window.localStorage.getItem(pendingInviteStorageKey);
+    return urlToken || storedToken || null;
+  });
+  const [joiningInvite, setJoiningInvite] = useState(false);
   const [callStatus, setCallStatus] = useState<
     "idle" | "requesting" | "ringing" | "connecting" | "in-call" | "error"
   >("idle");
@@ -233,6 +242,17 @@ function App() {
     },
     []
   );
+
+  const clearInviteQueryParam = useCallback(() => {
+    const url = new URL(window.location.href);
+    if (!url.searchParams.has("invite")) {
+      return;
+    }
+    url.searchParams.delete("invite");
+    const search = url.searchParams.toString();
+    const nextUrl = `${url.pathname}${search ? `?${search}` : ""}${url.hash ?? ""}`;
+    window.history.replaceState({}, "", nextUrl);
+  }, []);
 
   const normalizeCall = useCallback((row: Partial<CallRequestRow>): ActiveCall | null => {
     const id = Number(row.id);
@@ -544,6 +564,16 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!pendingInviteToken) {
+      return;
+    }
+    window.localStorage.setItem(pendingInviteStorageKey, pendingInviteToken);
+    if (!currentUser) {
+      setAuthNotice("Sign in to accept the invite link.");
+    }
+  }, [currentUser, pendingInviteToken]);
+
+  useEffect(() => {
     if (!currentUser) {
       resetCallMedia();
       setActiveCall(null);
@@ -574,6 +604,53 @@ function App() {
       alive = false;
     };
   }, [currentUser, ensureProfile, loadConversations, resetCallMedia]);
+
+  useEffect(() => {
+    if (!currentUser || !pendingInviteToken || joiningInvite) {
+      return;
+    }
+
+    let disposed = false;
+    const joinFromInvite = async () => {
+      setJoiningInvite(true);
+      setInviteFeedback("Joining invited room...");
+      const { data, error } = await supabase.rpc("accept_room_invite", {
+        p_token: pendingInviteToken
+      });
+
+      if (disposed) return;
+
+      if (error) {
+        setInviteFeedback(`Invite failed: ${error.message}`);
+        window.localStorage.removeItem(pendingInviteStorageKey);
+        setPendingInviteToken(null);
+        setJoiningInvite(false);
+        return;
+      }
+
+      const joinedConversationId = Number(data);
+      await loadConversations();
+      if (Number.isFinite(joinedConversationId)) {
+        setActiveConversationId(joinedConversationId);
+      }
+      window.localStorage.removeItem(pendingInviteStorageKey);
+      clearInviteQueryParam();
+      setPendingInviteToken(null);
+      setInviteFeedback("Invite accepted. You joined the room.");
+      setJoiningInvite(false);
+    };
+
+    void joinFromInvite();
+    return () => {
+      disposed = true;
+    };
+  }, [
+    clearInviteQueryParam,
+    currentUser,
+    joiningInvite,
+    loadConversations,
+    pendingInviteToken
+  ]);
 
   useEffect(() => {
     if (!currentUser || activeConversationId === null) {
@@ -930,6 +1007,7 @@ function App() {
       email,
       password,
       options: {
+        emailRedirectTo: `${window.location.origin}${window.location.pathname}`,
         data: {
           full_name: fullName,
           team_name: teamName
@@ -961,10 +1039,9 @@ function App() {
 
     setCreatingConversation(true);
     setChatError(null);
-    const { error } = await supabase.from("conversations").insert({
-      name: name.trim(),
-      description: description.trim(),
-      created_by: currentUser.id
+    const { data, error } = await supabase.rpc("create_conversation_room", {
+      p_name: name.trim(),
+      p_description: description.trim()
     });
 
     if (error) {
@@ -974,7 +1051,44 @@ function App() {
     }
 
     await loadConversations();
+    const createdConversationId = Number(data);
+    if (Number.isFinite(createdConversationId)) {
+      setActiveConversationId(createdConversationId);
+    }
     setCreatingConversation(false);
+  };
+
+  const createInviteLink = async () => {
+    if (!currentUser || activeConversationId === null) {
+      return;
+    }
+    setInviteFeedback(null);
+
+    const { data, error } = await supabase.rpc("create_room_invite", {
+      p_conversation_id: activeConversationId,
+      p_max_uses: 1,
+      p_expires_in_minutes: 60 * 24 * 7
+    });
+
+    if (error) {
+      setInviteFeedback(`Could not create invite: ${error.message}`);
+      return;
+    }
+
+    const token = String(data ?? "");
+    if (!token) {
+      setInviteFeedback("Invite token generation failed.");
+      return;
+    }
+
+    const inviteUrl = `${window.location.origin}${window.location.pathname}?invite=${token}`;
+    try {
+      await navigator.clipboard.writeText(inviteUrl);
+      setInviteFeedback("Invite link copied. Share it with the person you want to invite.");
+    } catch {
+      window.prompt("Copy this invite link", inviteUrl);
+      setInviteFeedback("Invite link generated.");
+    }
   };
 
   const requestCall = async () => {
@@ -1396,6 +1510,13 @@ function App() {
               Refresh
             </button>
             <button
+              disabled={activeConversationId === null}
+              onClick={createInviteLink}
+              type="button"
+            >
+              Invite
+            </button>
+            <button
               disabled={activeConversationId === null || callStatus === "connecting"}
               onClick={callForActiveConversation ? endCall : requestCall}
               type="button"
@@ -1413,6 +1534,7 @@ function App() {
 
         {chatError ? <p className="feedback error">{chatError}</p> : null}
         {callError ? <p className="feedback error">{callError}</p> : null}
+        {inviteFeedback ? <p className="feedback success">{inviteFeedback}</p> : null}
 
         {incomingCall && incomingCall.conversationId === activeConversationId ? (
           <section className="call-banner">
